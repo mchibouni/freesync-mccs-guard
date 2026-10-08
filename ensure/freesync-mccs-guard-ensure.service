@@ -1,0 +1,17 @@
+[Unit]
+Description=Rebuild the amdgpu FreeSync MCCS guard after a SteamOS A/B update
+Documentation=file:///usr/src/freesync-mccs-guard-1.0.0/INSTALL.md
+DefaultDependencies=no
+After=local-fs.target home.mount
+Wants=network-online.target
+After=network-online.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/deck/.local/share/freesync-mccs-guard/ensure-guard.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# check-updates -- ask SteamOS whether an OS update exists, WITHOUT ever letting
+# one install.
+#
+# Safe by construction: `steamos-update check` (= holo-update in check mode) only
+# ever calls `atomupd-manager check` and prints a build id. Applying is a wholly
+# separate call (`atomupd-manager update <id>`), which this script never makes.
+# atomupd.service is normally masked; we lift the mask only for the query and
+# always put it back, including on Ctrl-C or any error.
+#
+# Exit: 0 newer update available | 7 up to date | 9 offered build is OLDER
+#       (a downgrade) | 1 check failed
+#
+#   sudo ./check-updates          query only, never installs
+#   sudo ./check-updates apply    install ONLY if the offer is strictly newer;
+#                                 a downgrade is refused, not warned about.
+set -uo pipefail
+MODE="${1:-check}"
+[[ $EUID -eq 0 ]] || { echo "run with sudo"; exit 1; }
+G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+
+WAS_MASKED=0
+[[ "$(systemctl is-enabled atomupd.service 2>/dev/null)" == masked ]] && WAS_MASKED=1
+restore() {
+    if (( WAS_MASKED )); then
+        systemctl mask --now atomupd.service >/dev/null 2>&1
+        [[ "$(systemctl is-enabled atomupd.service 2>/dev/null)" == masked ]] \
+            && echo "  ${B}atomupd re-masked -- auto-install still disabled${N}" \
+            || echo "  ${R}WARNING: could not re-mask atomupd.service -- do it by hand!${N}"
+    fi
+}
+trap restore EXIT INT TERM
+
+(( WAS_MASKED )) && systemctl unmask atomupd.service >/dev/null 2>&1
+
+cur=$(atomupd-manager status 2>/dev/null | awk -F': ' '/Current Build ID/{print $2}' | tr -d ' ')
+branch=$(atomupd-manager tracked-branch 2>/dev/null)
+
+out=$(steamos-update check 2>/dev/null); rc=$?
+echo "${B}SteamOS update check${N}   $(date '+%F %T')"
+echo "  branch:  ${branch:-?}"
+echo "  running: ${cur:-?}"
+
+# build ids look like YYYYMMDD.N -- compare date part, then the minor
+newer() {
+    local a=${1%%.*} b=${2%%.*}; local am=${1#*.} bm=${2#*.}
+    (( a != b )) && { (( a > b )); return; }
+    (( 10#${am:-0} > 10#${bm:-0} ))
+}
+
+case $rc in
+7) echo "  ${G}${B}Up to date -- no update offered.${N}"; exit 7 ;;
+8) echo "  ${Y}${B}An update is already staged; it activates on next reboot.${N}"
+   echo "  ${Y}Reboot UNDOCKED and verify the guard before docking.${N}"; exit 8 ;;
+0)
+   echo "  offered: ${out:-?}"
+   if [[ -n $out && -n $cur ]] && ! newer "$out" "$cur"; then
+       echo
+       echo "  ${R}${B}THIS IS A DOWNGRADE, NOT AN UPDATE.${N}"
+       echo "  ${R}Offered build ${out} is OLDER than the ${cur} you are running${N}"
+       echo "  ${R}(you came from the 'preview' branch, which runs ahead of 'stable').${N}"
+       echo "  ${R}Applying it would roll the kernel back and wipe the FreeSync guard.${N}"
+       echo "  Ignore it until stable passes ${cur}."
+       [[ $MODE == apply ]] && echo "  ${R}${B}REFUSING TO APPLY.${N} Downgrades are blocked by this script."
+       exit 9
+   fi
+   echo
+   echo "  ${Y}${B}A genuine update is available.${N}"
+   if [[ $MODE != apply ]]; then
+       echo "  Nothing has been installed. To take it: sudo $0 apply"
+       exit 0
+   fi
+   echo "  ${B}applying ${out} ...${N}"
+   if atomupd-manager update "$out"; then
+       echo "  ${G}${B}Applied. It activates on the next reboot.${N}"
+       echo "  ${Y}${B}Reboot UNDOCKED -> sudo ~/kprobe/guard -> confirm armed=Y -> only then dock.${N}"
+       echo "  ${Y}The new kernel has NO guard until it is rebuilt.${N}"
+       exit 0
+   fi
+   echo "  ${R}apply failed${N}"; exit 1 ;;
+*) echo "  ${R}check failed (exit $rc)${N} -- network down, or the daemon could not start."; exit 1 ;;
+esac

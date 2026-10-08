@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# guard -- FreeSync MCCS kprobe mitigation: health check / restore vanilla sysctls
+#
+#   guard            full health check (read-only, safe to run any time)
+#   sudo guard       same, plus the root-only kprobe registration check
+#   guard vanilla    remove /etc/sysctl.d/99-panic-on-oops.conf (back to Valve defaults)
+#   guard rebuild    restore the module after a SteamOS update wiped /usr
+#
+# To remove the mitigation entirely, follow "## Undo" in ~/kprobe/INSTALL.md.
+# It must be done UNDOCKED and is deliberately not automated here.
+
+set -uo pipefail
+MOD=freesync_mccs_guard
+DKMS_NAME=freesync-mccs-guard
+DKMS_VER=1.0.0
+P=/sys/module/$MOD/parameters
+TARGET=dm_freesync_mccs_ddc_worker
+
+if [[ -t 1 ]]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'
+else G=''; R=''; Y=''; D=''; B=''; N=''; fi
+ok(){   printf "  ${G}PASS${N}  %s\n" "$1"; }
+bad(){  printf "  ${R}FAIL${N}  %s\n" "$1"; FAILED=1; }
+warn(){ printf "  ${Y}WARN${N}  %s\n" "$1"; }
+info(){ printf "  ${D}%s${N}\n" "$1"; }
+hdr(){  printf "\n${B}%s${N}\n" "$1"; }
+
+check() {
+    FAILED=0
+    printf "${B}FreeSync MCCS guard -- health check${N}   %s\n" "$(date '+%F %T')"
+    info "boot $(uptime -s), up $(awk '{printf "%dh %02dm", $1/3600, ($1%3600)/60}' /proc/uptime)"
+
+    hdr "Module"
+    if [[ -d /sys/module/$MOD ]]; then
+        armed=$(cat "$P/armed" 2>/dev/null)
+        skipped=$(cat "$P/skipped" 2>/dev/null)
+        nmissed=$(cat "$P/nmissed" 2>/dev/null)
+        [[ "$armed" == Y ]] && ok "armed = Y" || bad "armed = ${armed:-?}  -- probe NOT live, do not dock"
+        [[ "$nmissed" == 0 ]] && ok "nmissed = 0" || bad "nmissed = $nmissed  -- invocations slipped past"
+        if [[ "${skipped:-0}" -gt 0 ]]; then ok "skipped = $skipped  -- worker fired and was intercepted"
+        else warn "skipped = 0  -- worker has not fired yet this boot (not a failure)"; fi
+    else
+        bad "module not loaded"
+    fi
+
+    hdr "Kernel health"
+    T=$(cat /proc/sys/kernel/tainted)
+    if (( (T>>7) & 1 )); then bad "TAINT_DIE set -- an oops HAS occurred this boot"
+    else ok "TAINT_DIE clear -- no oops this boot"; fi
+    info "tainted=$T  (bit12 out-of-tree=$(( (T>>12)&1 )), bit13 unsigned=$(( (T>>13)&1 )); both expected)"
+    oops=$(journalctl -k -b 0 --no-pager 2>/dev/null | grep -c "Oops: Oops:")
+    [[ "$oops" == 0 ]] && ok "oops count = 0" || bad "oops count = $oops"
+    dst=$(ps -eo stat= --no-headers | grep -c '^D')
+    [[ "$dst" == 0 ]] && ok "D-state tasks = 0" || warn "D-state tasks = $dst  -- early sign of workqueue rot"
+    if (( dst > 0 )); then
+        for p in $(ps -eo stat=,pid= | awk '$1 ~ /^D/ {print $2}'); do
+            info "    $p $(cat /proc/$p/comm 2>/dev/null)  wchan=$(cat /proc/$p/wchan 2>/dev/null)"
+        done
+    fi
+
+    hdr "Boot wiring"
+    for f in /etc/modules-load.d/$DKMS_NAME.conf \
+             /etc/modprobe.d/$DKMS_NAME.conf \
+             /etc/systemd/system/$DKMS_NAME-verify.service \
+             /etc/atomic-update.conf.d/93-$DKMS_NAME.conf; do
+        [[ -e $f ]] && ok "$(basename "$f")" || bad "$(basename "$f") MISSING"
+    done
+    en=$(systemctl is-enabled $DKMS_NAME-verify.service 2>&1)
+    [[ "$en" == enabled ]] && ok "verify.service enabled" || bad "verify.service is-enabled: $en"
+    ac=$(systemctl is-active $DKMS_NAME-verify.service 2>&1)
+    started=$(systemctl show $DKMS_NAME-verify.service -p ExecMainStartTimestamp --value 2>/dev/null)
+    if [[ "$ac" == active ]]; then
+        ok "verify.service active -- armed before udev coldplug this boot"
+    elif [[ "$ac" == failed ]]; then
+        bad "verify.service FAILED -- guard was not armed in time; do not trust this boot"
+    elif [[ -z "$started" ]]; then
+        info "verify.service not yet run -- expected until the next reboot (enabled, never invoked)"
+    else
+        warn "verify.service is-active: $ac"
+    fi
+    ds=$(dkms status -m $DKMS_NAME -v $DKMS_VER 2>/dev/null | head -1)
+    [[ "$ds" == *installed* ]] && ok "dkms: $ds" || bad "dkms: ${ds:-not installed}"
+    modinfo $MOD >/dev/null 2>&1 && ok "modprobe resolves $MOD by name" || bad "modprobe cannot resolve $MOD"
+
+    hdr "Probe registration"
+    if [[ $EUID -eq 0 ]]; then
+        if grep -w "$TARGET" /sys/kernel/debug/kprobes/list 2>/dev/null | sed 's/^/    /'; then
+            ok "probe present in /sys/kernel/debug/kprobes/list"
+        else
+            bad "probe NOT found in /sys/kernel/debug/kprobes/list"
+        fi
+    else
+        info "run 'sudo $0' to include this root-only check"
+    fi
+
+    hdr "Sysctl"
+    po=$(cat /proc/sys/kernel/panic_on_oops)
+    if [[ -e /etc/sysctl.d/99-panic-on-oops.conf ]]; then
+        info "panic_on_oops=$po  -- override PRESENT, safety net still in place"
+    elif [[ "$po" == 1 ]]; then
+        ok "panic_on_oops=1  -- vanilla Valve default restored"
+    else
+        warn "override removed but panic_on_oops=$po -- reboot to apply"
+    fi
+
+    hdr "Display"
+    info "DP-11 : $(cat /sys/class/drm/card0-DP-11/status 2>/dev/null || echo 'connector not present')"
+    info "scanout: $(modetest -p 2>/dev/null | grep -E '^  #0' | head -1 | awk '{print $2, $3"Hz"}')"
+
+    printf "\n"
+    if (( FAILED )); then printf "${R}${B}RESULT: one or more checks FAILED${N}\n"
+    else printf "${G}${B}RESULT: all checks passed${N}\n"; fi
+    return $FAILED
+}
+
+vanilla() {
+    if [[ ! -e /etc/sysctl.d/99-panic-on-oops.conf ]]; then
+        echo "Already removed. panic_on_oops=$(cat /proc/sys/kernel/panic_on_oops)"
+        return 0
+    fi
+    echo "Restores Valve's default panic-on-oops behaviour."
+    echo "If the guard ever fails to arm, a docked boot will reboot-loop."
+    echo "Recovery in that case: unplug HDMI, it boots normally."
+    read -rp "Proceed? [y/N] " a
+    [[ ${a,,} == y ]] || { echo "aborted"; return 1; }
+    sudo steamos-readonly disable
+    sudo rm -f /etc/sysctl.d/99-panic-on-oops.conf
+    sudo steamos-readonly enable
+    echo "Done. Effective next boot (currently panic_on_oops=$(cat /proc/sys/kernel/panic_on_oops))."
+}
+
+
+rebuild() {
+    SRC=/home/deck/kprobe
+    KVER="$(uname -r)"
+    DKMS_KO=/usr/lib/modules/$KVER/updates/dkms/${MOD}.ko.zst
+    BAK=/home/deck/.local/share/freesync-mccs-guard/${MOD}.ko.zst.$KVER.rollback
+
+    echo "Rebuilding the guard (use after a SteamOS update replaced /usr)."
+    [[ -f $SRC/freesync_mccs_guard.c ]] || { echo "FATAL: $SRC/freesync_mccs_guard.c missing"; return 1; }
+    echo "  kernel: $KVER"
+    read -rp "Proceed? [y/N] " a; [[ ${a,,} == y ]] || { echo "aborted"; return 1; }
+
+    # --- always hand the rootfs back the way we found it, on ANY exit path.
+    # A bare `return 1` used to leave / mounted read-write indefinitely.
+    RO_WAS="$(steamos-readonly status 2>/dev/null || echo unknown)"
+    _restore_ro() {
+        [[ "$RO_WAS" == enabled ]] && { sudo steamos-readonly enable && echo "  (rootfs read-only restored)"; }
+        trap - RETURN
+    }
+    trap _restore_ro RETURN
+
+    echo "== space check =="
+    root_free=$(df -Pm / | awk 'NR==2{print $4}')
+    var_free=$(df -Pm /var | awk 'NR==2{print $4}')
+    echo "  / has ${root_free}M free, /var has ${var_free}M free"
+    (( root_free < 400 )) && { echo "FATAL: < 400M free on / -- pacman cannot install headers. Free space first."; return 1; }
+    (( var_free  <  50 )) && { echo "FATAL: < 50M free on /var -- dkms has nowhere to build."; return 1; }
+
+    sudo steamos-readonly disable || { echo "FATAL: cannot make / writable"; return 1; }
+
+    echo "== toolchain / headers =="
+    sudo pacman -S --needed --noconfirm dkms base-devel linux-neptune-72-headers || {
+        echo "FATAL: package install failed (keyring? try: sudo pacman-key --init && sudo pacman-key --populate)"
+        return 1; }
+    [[ -f /usr/lib/modules/$KVER/build/Makefile ]] || {
+        echo "FATAL: no kernel headers at /usr/lib/modules/$KVER/build -- dkms 'Cleaning build area' will fail with exit 2"
+        return 1; }
+
+    echo "== restoring /usr/src from $SRC =="
+    sudo install -d -m 0755 /usr/src/$DKMS_NAME-$DKMS_VER
+    sudo install -m 0644 "$SRC/freesync_mccs_guard.c" "$SRC/Makefile" "$SRC/dkms.conf" /usr/src/$DKMS_NAME-$DKMS_VER/
+    [[ -f $SRC/INSTALL.md ]] && sudo install -m 0644 "$SRC/INSTALL.md" /usr/src/$DKMS_NAME-$DKMS_VER/
+
+    # --- keep a rollback copy of the module that is currently installed.
+    # `dkms remove` below deletes it, and if the build then fails the machine is
+    # left with NO guard -- which is exactly how a failed rebuild turns into a
+    # bootloop on the next docked boot.
+    if [[ -f $DKMS_KO ]]; then
+        mkdir -p "$(dirname "$BAK")"
+        sudo cp -a "$DKMS_KO" "$BAK" && echo "  rollback copy: $BAK"
+    fi
+    _rollback() {
+        [[ -f $BAK ]] || { echo "  !! no rollback copy -- THE MACHINE IS UNGUARDED, do not dock"; return; }
+        echo "  rolling back to the previously installed module"
+        sudo install -Dm0644 "$BAK" "$DKMS_KO" && sudo depmod -a "$KVER" \
+            && echo "  rollback OK -- guard restored (dkms tree still needs repair)"
+    }
+
+    echo "== dkms =="
+    sudo dkms remove -m $DKMS_NAME -v $DKMS_VER --all 2>/dev/null
+    sudo dkms add -m $DKMS_NAME -v $DKMS_VER
+    sudo dkms build -m $DKMS_NAME -v $DKMS_VER -k "$KVER" || {
+        echo "FATAL: build failed"
+        sudo tail -20 /var/lib/dkms/$DKMS_NAME/$DKMS_VER/build/make.log 2>/dev/null
+        _rollback; return 1; }
+    sudo dkms install -m $DKMS_NAME -v $DKMS_VER -k "$KVER" || { echo "FATAL: install failed"; _rollback; return 1; }
+    sudo depmod -a "$KVER"
+
+    echo "== boot wiring =="
+    for rel in modules-load.d/$DKMS_NAME.conf modprobe.d/$DKMS_NAME.conf \
+               systemd/system/$DKMS_NAME-verify.service atomic-update.conf.d/93-$DKMS_NAME.conf; do
+        [[ -f $SRC/rootfs/etc/$rel ]] && sudo install -Dm0644 "$SRC/rootfs/etc/$rel" "/etc/$rel"
+    done
+    sudo systemctl daemon-reload
+    sudo systemctl enable $DKMS_NAME-verify.service
+
+    echo
+    echo "!! VERIFY THE STRUCT LAYOUT BEFORE TRUSTING THIS ON A NEW KERNEL !!"
+    echo "   The guard calls kfree(work), valid ONLY while 'struct work_struct work'"
+    echo "   is the FIRST member of struct dm_freesync_mccs_ddc_work."
+    echo "   If Valve reordered it, this rebuild will load cleanly and corrupt the heap."
+    echo "   Check drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c in the neptune tree."
+    echo
+    echo "Then: reboot UNDOCKED, run '$0', confirm armed=Y before docking."
+}
+
+case "${1:-check}" in
+    check|"") check ;;
+    vanilla)  vanilla ;;
+    rebuild)  rebuild ;;
+    *) echo "usage: ${0##*/} [check|vanilla|rebuild]"; echo "       removal: see ## Undo in ~/kprobe/INSTALL.md"; exit 2 ;;
+esac

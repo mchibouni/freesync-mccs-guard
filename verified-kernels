@@ -1,0 +1,5 @@
+# Kernel releases whose 'struct dm_freesync_mccs_ddc_work' layout has been
+# CHECKED BY A HUMAN (work_struct must be the FIRST member -- the guard calls
+# kfree(work) and will silently corrupt the heap otherwise).
+# Add a line only after checking amdgpu_dm.c in the matching neptune tree.
+7.2.0-valve1-1-neptune-72-gd39b4282853d

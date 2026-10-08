@@ -19,6 +19,26 @@ Reported to Valve as
 [ValveSoftware/SteamOS#2786](https://github.com/ValveSoftware/SteamOS/issues/2786).
 The full root-cause analysis is in [BUG-REPORT.md](BUG-REPORT.md).
 
+## Status
+
+Not fixed as of 2026-10-08. Every SteamOS build and kernel Valve has
+published since still has the same worker:
+
+| Branch | Newest build | SteamOS | Kernel |
+|---|---|---|---|
+| stable | 20260922.1 | 3.8.28 | 6.18.50-valve2 |
+| beta / preview | 20260925.101 | 3.9.2 | 7.2.7-valve1 |
+| main | 20260924.1000 | 3.10.0 | 7.2.4-valve1 |
+
+`dm_freesync_mccs_ddc_worker()` is identical in all of them and in the newest
+kernel tag, 7.2.7-valve2, which no image ships yet. It still takes
+`&aconn->dm_dp_aux.aux.ddc` without checking that the adapter is registered
+([amdgpu_dm.c#L181-L236 at 7.2.7-valve2](https://github.com/evlaV/linux-integration/blob/7.2.7-valve2/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c#L181-L236),
+via the evlaV mirror of Valve's kernel tree). `struct work_struct work` is
+still the first member of `struct dm_freesync_mccs_ddc_work` in those kernels,
+so the guard's `kfree(work)` remains correct there. Each new kernel still has
+to be checked and added to `verified-kernels` before the guard is rebuilt for it.
+
 ## Are you affected?
 
 To see the crash without the reboot, boot undocked, turn off panic-on-oops for

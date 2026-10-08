@@ -1,0 +1,14 @@
+[Unit]
+Description=Verify FreeSync MCCS kprobe mitigation
+Documentation=file:/home/deck/kprobe/INSTALL.md
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=systemd-udev-trigger.service sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -ec 'test -r /sys/module/freesync_mccs_guard/parameters/armed; test "$(cat /sys/module/freesync_mccs_guard/parameters/armed)" = Y'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

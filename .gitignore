@@ -1,0 +1,12 @@
+# kbuild output
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+# local backups
+*.bak*
+*.rollback
